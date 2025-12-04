@@ -1,0 +1,11 @@
+CompileFlags:
+  Add: 
+    - "--cuda-path=/sw/pkgs/arc/cuda/12.8.1"
+    - "-I/sw/pkgs/arc/cuda/12.8.1/include"
+    - "--cuda-gpu-arch=sm_80"
+    - "-nocudalib"
+    - "-Wno-unknown-cuda-version"
+Diagnostics:
+  Suppress: ["*"]
+  ClangTidy:
+    Remove: ["*"]

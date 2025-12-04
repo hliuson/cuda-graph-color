@@ -5,6 +5,17 @@
 #include <sstream>
 #include <algorithm>
 
+#include <thrust/device_vector.h>
+#include <thrust/host_vector.h>
+#include <thrust/reduce.h>
+#include <thrust/scan.h>
+#include <thrust/fill.h>
+#include <thrust/transform.h>
+#include <thrust/functional.h>
+#include <thrust/iterator/counting_iterator.h>
+#include <thrust/iterator/transform_iterator.h>
+#include <thrust/count.h>
+
 static void load_edges_to_csc(const char *path,
                               std::vector<int> &colPtr,
                               std::vector<int> &rowIdx,
@@ -161,9 +172,7 @@ __global__ void luby_mis_coloring_iter(int *vertex_pointers, int *adjacencies, i
 
 
 __device__ void reduce(int n, int *result) {
-
-        // Reduction code for colored count...
-    v = n;
+    int v = n;
     v += __shfl_down_sync(0xFFFFFFFF, v, 16);
     v += __shfl_down_sync(0xFFFFFFFF, v, 8);
     v += __shfl_down_sync(0xFFFFFFFF, v, 4);
@@ -172,7 +181,7 @@ __device__ void reduce(int n, int *result) {
     
     __shared__ int warp_sum[32];
     if (threadIdx.x % 32 == 0) {
-        warp_sum[threadIdx.x / 32] = colored;
+        warp_sum[threadIdx.x / 32] = v;
     }
 
     __syncthreads();
@@ -240,6 +249,416 @@ __global__ void verify_coloring(int *vertex_pointers, int *adjacencies, int vert
                 break;
             }
         }
+    }
+}
+
+
+// Compute total active edges across all active vertices
+// Uses the reduce function to do block-level reduction, final reduction on CPU
+__global__ void compute_active_edges(int *vertex_pointers, int *adjacencies, int vertices, 
+                                     int *priorities, int *block_edge_sums) {
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    int gridsize = blockDim.x * gridDim.x;
+    
+    int local_edges = 0;
+    
+    for (int i = tid; i < vertices; i += gridsize) {
+        if (priorities[i] == -1) { // active vertex
+            for (int j = vertex_pointers[i]; j < vertex_pointers[i + 1]; j++) {
+                int neighbor = adjacencies[j];
+                if (priorities[neighbor] == -1) {
+                    local_edges++;
+                }
+            }
+        }
+    }
+    
+    __syncthreads();
+    reduce(local_edges, block_edge_sums);
+}
+
+
+//at each iteration, we would like to color the vertices which have maximum degree
+__global__ void smallest_last_ordering(int *vertex_pointers, int *adjacencies, int vertices, int activeVertices, int iteration, int *priorities, int *degrees, int average_degree, float eps, int *n_marked) {
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    int gridsize = blockDim.x * gridDim.x;
+    int threshold = average_degree * (1 + eps);
+
+    int marked_count = 0;
+
+    for (int i = tid; i < vertices; i += gridsize) {
+        if (priorities[i] == -1) { //active vertex
+            if (degrees[i] <= threshold) {
+                priorities[i] = iteration; //mark as processed
+                marked_count++;
+            }
+        }
+    }
+    __syncthreads();
+    reduce(marked_count, n_marked);
+}
+
+__global__ void update_degrees(int *vertex_pointers, int *adjacencies, int vertices, int iteration, int *priorities, int *degrees) {
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    int gridsize = blockDim.x * gridDim.x;
+    for (int i = tid; i < vertices; i += gridsize) {
+        if (priorities[i] == -1) { //active vertex
+            int diff = 0;
+            //scan over neighbors to decrement degree for marked neighbors
+            for (int j = vertex_pointers[i]; j < vertex_pointers[i + 1]; j++) {
+                int neighbor = adjacencies[j];
+                if (priorities[neighbor] == iteration) {
+                    diff++;
+                }
+            }
+            degrees[i] -= diff;
+        }
+    }
+
+}
+
+
+// ============================================================================
+// Sort-based graph reordering by priority
+// Reorders vertices so same-priority vertices are contiguous
+// Single graph, single allocation - just track priority boundaries
+// ============================================================================
+
+#include <thrust/sort.h>
+#include <thrust/sequence.h>
+#include <thrust/gather.h>
+
+// Scatter edges using the permutation (keeps ALL edges, just remaps indices)
+// perm: new_idx -> old_idx (which vertex goes where)
+// inv_perm: old_idx -> new_idx (where each vertex went)
+__global__ void scatter_edges_by_perm(
+    int *old_vertex_pointers, int *old_adjacencies, int vertices,
+    int *perm, int *inv_perm,
+    int *new_vertex_pointers, int *new_adjacencies,
+    int *edge_offsets) {
+    
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    int gridsize = blockDim.x * gridDim.x;
+    
+    for (int new_idx = tid; new_idx < vertices; new_idx += gridsize) {
+        int old_idx = perm[new_idx];
+        int degree = old_vertex_pointers[old_idx + 1] - old_vertex_pointers[old_idx];
+        int out_start = edge_offsets[new_idx];
+        
+        new_vertex_pointers[new_idx] = out_start;
+        
+        for (int j = 0; j < degree; j++) {
+            int old_neighbor = old_adjacencies[old_vertex_pointers[old_idx] + j];
+            // Remap neighbor through inverse permutation
+            new_adjacencies[out_start + j] = inv_perm[old_neighbor];
+        }
+    }
+}
+
+// Result structure for sorted graph
+struct SortedGraph {
+    int *vertex_pointers;    // CSC pointers for reordered graph
+    int *adjacencies;        // CSC adjacencies (remapped indices)
+    int *perm;               // new_idx -> old_idx
+    int *inv_perm;           // old_idx -> new_idx  
+    int *priority_offsets;   // priority p vertices are in [priority_offsets[p], priority_offsets[p+1])
+    int num_priorities;
+    int vertices;
+    int edges;
+};
+
+// Sort graph by priority - creates a reordered graph where same-priority vertices are contiguous
+// Returns pointers to device memory (caller responsible for freeing)
+void sort_graph_by_priority(
+    int *d_vertex_pointers, int *d_adjacencies, int vertices, int edges,
+    int *d_priorities, int num_priorities,
+    SortedGraph &result,
+    int numBlocks, int blockSize) {
+    
+    result.vertices = vertices;
+    result.edges = edges;  // Same number of edges - we keep them all
+    result.num_priorities = num_priorities;
+    
+    // Allocate permutation arrays
+    int *d_perm, *d_inv_perm, *d_priorities_copy;
+    cudaMalloc(&d_perm, sizeof(int) * vertices);
+    cudaMalloc(&d_inv_perm, sizeof(int) * vertices);
+    cudaMalloc(&d_priorities_copy, sizeof(int) * vertices);
+    
+    // Initialize perm to identity: perm[i] = i
+    thrust::device_ptr<int> perm_ptr(d_perm);
+    thrust::sequence(perm_ptr, perm_ptr + vertices);
+    
+    // Copy priorities (sort will modify keys)
+    cudaMemcpy(d_priorities_copy, d_priorities, sizeof(int) * vertices, cudaMemcpyDeviceToDevice);
+    
+    // Sort perm by priorities: after this, perm[new_idx] = old_idx
+    // Vertices are grouped by priority
+    thrust::device_ptr<int> prio_ptr(d_priorities_copy);
+    thrust::sort_by_key(prio_ptr, prio_ptr + vertices, perm_ptr);
+    
+    // Build inverse permutation: inv_perm[old_idx] = new_idx
+    thrust::device_ptr<int> inv_perm_ptr(d_inv_perm);
+    thrust::scatter(
+        thrust::counting_iterator<int>(0),
+        thrust::counting_iterator<int>(vertices),
+        perm_ptr,
+        inv_perm_ptr);
+    
+    // Compute priority boundaries by scanning sorted priorities
+    int *h_priority_offsets = (int*)malloc(sizeof(int) * (num_priorities + 1));
+    thrust::host_vector<int> h_sorted_prios(vertices);
+    cudaMemcpy(h_sorted_prios.data(), d_priorities_copy, sizeof(int) * vertices, cudaMemcpyDeviceToHost);
+    
+    h_priority_offsets[0] = 0;
+    int current_prio = 0;
+    for (int i = 0; i < vertices && current_prio < num_priorities; i++) {
+        while (current_prio < h_sorted_prios[i] && current_prio < num_priorities) {
+            current_prio++;
+            h_priority_offsets[current_prio] = i;
+        }
+    }
+    while (current_prio < num_priorities) {
+        current_prio++;
+        h_priority_offsets[current_prio] = vertices;
+    }
+    h_priority_offsets[num_priorities] = vertices;
+    
+    cudaMalloc(&result.priority_offsets, sizeof(int) * (num_priorities + 1));
+    cudaMemcpy(result.priority_offsets, h_priority_offsets, sizeof(int) * (num_priorities + 1), cudaMemcpyHostToDevice);
+    
+    // Gather degrees into new order and compute edge offsets
+    // reordered_degrees[new_idx] = degree of perm[new_idx] in original graph
+    int *d_reordered_degrees, *d_edge_offsets;
+    cudaMalloc(&d_reordered_degrees, sizeof(int) * vertices);
+    cudaMalloc(&d_edge_offsets, sizeof(int) * vertices);
+    
+    // Compute degrees by gathering from vertex_pointers differences
+    // degree[old] = vertex_pointers[old+1] - vertex_pointers[old]
+    // We need reordered_degrees[new] = degree[perm[new]]
+    thrust::device_ptr<int> vp_ptr(d_vertex_pointers);
+    thrust::device_ptr<int> reord_deg_ptr(d_reordered_degrees);
+    
+    // Use transform with gather to compute reordered degrees
+    thrust::transform(
+        thrust::make_permutation_iterator(vp_ptr + 1, perm_ptr),
+        thrust::make_permutation_iterator(vp_ptr + 1, perm_ptr + vertices),
+        thrust::make_permutation_iterator(vp_ptr, perm_ptr),
+        reord_deg_ptr,
+        thrust::minus<int>());
+    
+    // Prefix sum to get edge offsets
+    thrust::device_ptr<int> eo_ptr(d_edge_offsets);
+    thrust::exclusive_scan(reord_deg_ptr, reord_deg_ptr + vertices, eo_ptr);
+    
+    // Allocate output graph (same size as input - all edges kept)
+    cudaMalloc(&result.vertex_pointers, sizeof(int) * (vertices + 1));
+    cudaMalloc(&result.adjacencies, sizeof(int) * edges);
+    
+    // Scatter edges
+    scatter_edges_by_perm<<<numBlocks, blockSize>>>(
+        d_vertex_pointers, d_adjacencies, vertices,
+        d_perm, d_inv_perm,
+        result.vertex_pointers, result.adjacencies,
+        d_edge_offsets);
+    
+    // Set final vertex pointer
+    thrust::device_ptr<int> new_vp_ptr(result.vertex_pointers);
+    new_vp_ptr[vertices] = edges;
+    
+    // Store permutations in result
+    result.perm = d_perm;
+    result.inv_perm = d_inv_perm;
+    
+    // Cleanup temporaries
+    cudaFree(d_priorities_copy);
+    cudaFree(d_reordered_degrees);
+    cudaFree(d_edge_offsets);
+    free(h_priority_offsets);
+}
+
+// Free sorted graph
+void free_sorted_graph(SortedGraph &g) {
+    if (g.vertex_pointers) cudaFree(g.vertex_pointers);
+    if (g.adjacencies) cudaFree(g.adjacencies);
+    if (g.perm) cudaFree(g.perm);
+    if (g.inv_perm) cudaFree(g.inv_perm);
+    if (g.priority_offsets) cudaFree(g.priority_offsets);
+}
+
+// ============================================================================
+// Partition-based greedy coloring
+// Colors one priority partition at a time
+// ============================================================================
+
+// Color a single partition using greedy algorithm
+// Vertices in [start_idx, end_idx) are colored
+// coloring: array of size total_vertices (in sorted order)
+// All neighbors (including cross-partition) are considered for conflicts
+__global__ void color_partition_greedy(
+    int *vertex_pointers, int *adjacencies,
+    int start_idx, int end_idx,
+    int *coloring) {
+    
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    int gridsize = blockDim.x * gridDim.x;
+    
+    const int MAX_COLOR_WORDS = 8;  // Supports up to 256 colors
+    
+    for (int i = start_idx + tid; i < end_idx; i += gridsize) {
+        // Skip if already colored
+        if (coloring[i] != -1) continue;
+        
+        // Build used color mask from ALL neighbors
+        unsigned int used_colors[MAX_COLOR_WORDS] = {0};
+        
+        for (int j = vertex_pointers[i]; j < vertex_pointers[i + 1]; j++) {
+            int neighbor = adjacencies[j];
+            int nc = coloring[neighbor];
+            if (nc >= 0 && nc < MAX_COLOR_WORDS * 32) {
+                used_colors[nc / 32] |= (1u << (nc % 32));
+            }
+        }
+        
+        // TODO: Stub - actual color assignment goes here
+        // For now, find first available color (greedy)
+        int color = 0;
+        for (int w = 0; w < MAX_COLOR_WORDS; w++) {
+            if (~used_colors[w] != 0) {
+                color = w * 32 + __ffs(~used_colors[w]) - 1;
+                break;
+            }
+        }
+        
+        coloring[i] = color;
+    }
+}
+
+// Host function to color all partitions in priority order
+// Colors are assigned in the sorted graph's vertex order
+// Returns coloring array (in sorted order) - use perm to map back to original
+void color_by_partition(
+    SortedGraph &sg,
+    int *d_coloring,          // output: size vertices, caller allocates
+    int *h_priority_offsets,  // host copy of priority offsets
+    int numBlocks, int blockSize) {
+    
+    // Initialize all vertices as uncolored
+    cudaMemset(d_coloring, -1, sizeof(int) * sg.vertices);
+    
+    // Color partitions in reverse priority order (highest priority = colored last = lowest degree)
+    // This way, when we color partition p, all higher-priority partitions are already colored
+    for (int p = sg.num_priorities - 1; p >= 0; p--) {
+        int start_idx = h_priority_offsets[p];
+        int end_idx = h_priority_offsets[p + 1];
+        
+        if (start_idx >= end_idx) continue;  // Empty partition
+        
+        printf("[INFO] Coloring partition %d: vertices [%d, %d)\n", p, start_idx, end_idx);
+        
+        color_partition_greedy<<<numBlocks, blockSize>>>(
+            sg.vertex_pointers, sg.adjacencies,
+            start_idx, end_idx,
+            d_coloring);
+        
+        cudaDeviceSynchronize();
+    }
+}
+
+// Map coloring from sorted order back to original vertex order
+__global__ void unmap_coloring(
+    int *sorted_coloring,   // coloring in sorted vertex order
+    int *original_coloring, // output: coloring in original vertex order
+    int *perm,              // perm[sorted_idx] = original_idx
+    int vertices) {
+    
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    int gridsize = blockDim.x * gridDim.x;
+    
+    for (int sorted_idx = tid; sorted_idx < vertices; sorted_idx += gridsize) {
+        int original_idx = perm[sorted_idx];
+        original_coloring[original_idx] = sorted_coloring[sorted_idx];
+    }
+}
+
+// Functor to check if a vertex is active (priority == -1)
+struct is_active {
+    __host__ __device__ bool operator()(int priority) const {
+        return priority == -1;
+    }
+};
+
+// Functor to compute active edges for a vertex
+struct active_edge_counter {
+    int *vertex_pointers;
+    int *adjacencies;
+    int *priorities;
+    
+    active_edge_counter(int *vp, int *adj, int *prio) 
+        : vertex_pointers(vp), adjacencies(adj), priorities(prio) {}
+    
+    __host__ __device__ int operator()(int i) const {
+        if (priorities[i] != -1) return 0;
+        int count = 0;
+        for (int j = vertex_pointers[i]; j < vertex_pointers[i + 1]; j++) {
+            if (priorities[adjacencies[j]] == -1) {
+                count++;
+            }
+        }
+        return count;
+    }
+};
+
+// Host function to get average degree across active nodes using Thrust
+// Returns average degree (total_active_edges / active_vertices)
+float get_average_degree(int *d_vertex_pointers, int *d_adjacencies, int vertices, int *d_priorities) {
+    thrust::device_ptr<int> prio_ptr(d_priorities);
+    
+    // Count active vertices using Thrust
+    int total_vertices = thrust::count_if(prio_ptr, prio_ptr + vertices, is_active());
+    
+    if (total_vertices == 0) return 0.0f;
+    
+    // Count active edges using transform_reduce
+    active_edge_counter counter(d_vertex_pointers, d_adjacencies, d_priorities);
+    int total_edges = thrust::transform_reduce(
+        thrust::counting_iterator<int>(0),
+        thrust::counting_iterator<int>(vertices),
+        counter,
+        0,
+        thrust::plus<int>());
+    
+    return (float)total_edges / (float)total_vertices;
+}
+
+// Legacy kernel-based versions kept for compatibility
+// Compute count of active vertices
+// Uses the reduce function to do block-level reduction, final reduction on CPU
+__global__ void compute_active_vertices(int *priorities, int vertices, int *block_vertex_counts) {
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    int gridsize = blockDim.x * gridDim.x;
+    
+    int local_vertices = 0;
+    
+    for (int i = tid; i < vertices; i += gridsize) {
+        if (priorities[i] == -1) { // active vertex
+            local_vertices++;
+        }
+    }
+    
+    __syncthreads();
+    reduce(local_vertices, block_vertex_counts);
+}
+
+__global__ void blockwise_mis_color(int *vertex_pointers, int *adjacencies, int vertices, 
+                        int *coloring, int *candidates, int *n_colored) {
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    int gridsize = blockDim.x * gridDim.x;
+    
+    int colored = 0;
+    int done = 0;
+    while (!done) {
+
     }
 }
 
