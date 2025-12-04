@@ -10,7 +10,9 @@ static void load_edges_to_csc(const char *path,
                               std::vector<int> &rowIdx,
                               int &vertices,
                               int &edges,
-                              bool zeroBaseInput = true) {
+                              bool zeroBaseInput = true,
+                              bool csv = false
+                            ) {
     std::ifstream fin(path);
     if (!fin) {
         fprintf(stderr, "Failed to open edges file: %s\n", path);
@@ -26,9 +28,24 @@ static void load_edges_to_csc(const char *path,
     while (std::getline(fin, line)) {
         if (line.empty()) continue;
         if (line[0] == '#') continue;
-        std::istringstream iss(line);
+        
         int u, v;
-        if (!(iss >> u >> v)) continue;
+        if (csv) {
+            // Parse CSV format: v1,v2
+            size_t commaPos = line.find(',');
+            if (commaPos == std::string::npos) continue;
+            try {
+                u = std::stoi(line.substr(0, commaPos));
+                v = std::stoi(line.substr(commaPos + 1));
+            } catch (...) {
+                continue;
+            }
+        } else {
+            // Parse whitespace-separated format
+            std::istringstream iss(line);
+            if (!(iss >> u >> v)) continue;
+        }
+        
         if (!zeroBaseInput) { u -= 1; v -= 1; }
         if (u < 0 || v < 0) continue;
         // Add edge in both directions for undirected graph
@@ -104,10 +121,11 @@ __global__ void luby_mis_coloring_iter(int *vertex_pointers, int *adjacencies, i
     int tid = blockIdx.x * blockDim.x + threadIdx.x;
     int gridsize = blockDim.x * gridDim.x;
     
-    // Phase 1: Mark candidates (vertices with no higher-ID uncolored neighbor)
+    const int MAX_COLOR_WORDS = 8;  // Supports up to 256 colors
+    
     for (int i = tid; i < vertices; i += gridsize) {
-        candidates[i] = 0;
-        if (coloring[i] != -1) continue;  // Already colored
+        candidates[i] = -1;
+        if (coloring[i] != -1) continue;
         
         int is_candidate = 1;
         for (int j = vertex_pointers[i]; j < vertex_pointers[i + 1]; j++) {
@@ -117,8 +135,59 @@ __global__ void luby_mis_coloring_iter(int *vertex_pointers, int *adjacencies, i
                 break;
             }
         }
-        candidates[i] = is_candidate;
+        
+        if (is_candidate) {
+            unsigned int used_colors[MAX_COLOR_WORDS] = {0};
+            
+            for (int j = vertex_pointers[i]; j < vertex_pointers[i + 1]; j++) {
+                int neighbor = adjacencies[j];
+                int nc = coloring[neighbor];
+                if (nc >= 0 && nc < MAX_COLOR_WORDS * 32) {
+                    used_colors[nc / 32] |= (1u << (nc % 32));
+                }
+            }
+            
+            int color = 0;
+            for (int w = 0; w < MAX_COLOR_WORDS; w++) {
+                if (~used_colors[w] != 0) {
+                    color = w * 32 + __ffs(~used_colors[w]) - 1;
+                    break;
+                }
+            }
+            candidates[i] = color;
+        }
     }
+}
+
+
+__device__ void reduce(int n, int *result) {
+
+        // Reduction code for colored count...
+    v = n;
+    v += __shfl_down_sync(0xFFFFFFFF, v, 16);
+    v += __shfl_down_sync(0xFFFFFFFF, v, 8);
+    v += __shfl_down_sync(0xFFFFFFFF, v, 4);
+    v += __shfl_down_sync(0xFFFFFFFF, v, 2);
+    v += __shfl_down_sync(0xFFFFFFFF, v, 1);
+    
+    __shared__ int warp_sum[32];
+    if (threadIdx.x % 32 == 0) {
+        warp_sum[threadIdx.x / 32] = colored;
+    }
+
+    __syncthreads();
+    if (threadIdx.x < 32) {
+        v = (threadIdx.x < (blockDim.x + 31) / 32) ? warp_sum[threadIdx.x] : 0;
+        v += __shfl_down_sync(0xFFFFFFFF, v, 16);
+        v += __shfl_down_sync(0xFFFFFFFF, v, 8);
+        v += __shfl_down_sync(0xFFFFFFFF, v, 4);
+        v += __shfl_down_sync(0xFFFFFFFF, v, 2);
+        v += __shfl_down_sync(0xFFFFFFFF, v, 1);
+    }
+    if (threadIdx.x == 0) {
+        result[blockIdx.x] = v;
+    }
+
 }
 
 __global__ void apply_coloring(int *vertex_pointers, int *adjacencies, int vertices,
@@ -128,49 +197,27 @@ __global__ void apply_coloring(int *vertex_pointers, int *adjacencies, int verti
     
     int colored = 0;
     for (int i = tid; i < vertices; i += gridsize) {
-        if (candidates[i] && coloring[i] == -1) {
+        // Fix: check for >= 0 instead of truthiness
+        if (candidates[i] >= 0 && coloring[i] == -1) {
             // Check no lower-ID neighbor is also a candidate
             int safe = 1;
             for (int j = vertex_pointers[i]; j < vertex_pointers[i + 1]; j++) {
                 int neighbor = adjacencies[j];
-                if (neighbor < i && candidates[neighbor]) {
+                if (neighbor < i && candidates[neighbor] >= 0) {
                     safe = 0;
                     break;
                 }
             }
             if (safe) {
-                coloring[i] = iteration;
+                coloring[i] = candidates[i];  // Use the precomputed color
                 colored++;
             }
         }
     }
-    
-    // Reduction code for colored count...
     __syncthreads();
-    colored += __shfl_down_sync(0xFFFFFFFF, colored, 16);
-    colored += __shfl_down_sync(0xFFFFFFFF, colored, 8);
-    colored += __shfl_down_sync(0xFFFFFFFF, colored, 4);
-    colored += __shfl_down_sync(0xFFFFFFFF, colored, 2);
-    colored += __shfl_down_sync(0xFFFFFFFF, colored, 1);
-    
-    __shared__ int warp_sum[32];
-    if (threadIdx.x % 32 == 0) {
-        warp_sum[threadIdx.x / 32] = colored;
-    }
-
-    __syncthreads();
-    if (threadIdx.x < 32) {
-        colored = (threadIdx.x < (blockDim.x + 31) / 32) ? warp_sum[threadIdx.x] : 0;
-        colored += __shfl_down_sync(0xFFFFFFFF, colored, 16);
-        colored += __shfl_down_sync(0xFFFFFFFF, colored, 8);
-        colored += __shfl_down_sync(0xFFFFFFFF, colored, 4);
-        colored += __shfl_down_sync(0xFFFFFFFF, colored, 2);
-        colored += __shfl_down_sync(0xFFFFFFFF, colored, 1);
-    }
-    if (threadIdx.x == 0) {
-        n_colored[blockIdx.x] = colored;
-    }
+    reduce(colored, n_colored);
 }
+
 __global__ void verify_coloring(int *vertex_pointers, int *adjacencies, int vertices, int *coloring,
     int *colors, int *uncolored_count, int *conflict_count) {
     int tid = blockIdx.x * blockDim.x + threadIdx.x;
@@ -196,6 +243,7 @@ __global__ void verify_coloring(int *vertex_pointers, int *adjacencies, int vert
     }
 }
 
+
 int main(int argc, char *argv[]) {
     int *h_adjacencies = nullptr;
     int *h_vertex_pointers = nullptr;
@@ -205,8 +253,14 @@ int main(int argc, char *argv[]) {
     const char *edgeFile = (argc > 1) ? argv[1] : "1684.edges";
     std::vector<int> colPtr, rowIdx;
     // Assume input is 0-based; set false if file is 1-based
-    printf("[INFO] Parsing edges from: %s\n", edgeFile);
-    load_edges_to_csc(edgeFile, colPtr, rowIdx, vertices, edges, true);
+    // Detect CSV format by file extension
+    bool isCsv = false;
+    std::string edgeFileStr(edgeFile);
+    if (edgeFileStr.size() >= 4 && edgeFileStr.substr(edgeFileStr.size() - 4) == ".csv") {
+        isCsv = true;
+    }
+    printf("[INFO] Parsing edges from: %s (CSV mode: %s)\n", edgeFile, isCsv ? "yes" : "no");
+    load_edges_to_csc(edgeFile, colPtr, rowIdx, vertices, edges, true, isCsv);
     if (vertices == 0 || edges == 0) {
         fprintf(stderr, "No edges/vertices parsed from %s. Exiting.\n", edgeFile);
         return 1;
@@ -249,10 +303,22 @@ int main(int argc, char *argv[]) {
     int cum_colored = 0;
     printf("[INFO] Starting Luby MIS coloring iterations...\n");
     int iter = 0;
+
     while (cum_colored < vertices) {
+            //time
+        cudaEvent_t start, stop;
+        cudaEventCreate(&start);
+        cudaEventCreate(&stop);
+        cudaEventRecord(start);
         luby_mis_coloring_iter<<<numBlocks, blockSize>>>(vertex_pointers, adjacencies, vertices, coloring, candidates, n_colored, iter);
         apply_coloring<<<numBlocks, blockSize>>>(vertex_pointers, adjacencies, vertices, coloring, candidates, n_colored, iter);
-        cudaDeviceSynchronize();
+        
+        cudaEventRecord(stop);
+        cudaEventSynchronize(stop);
+        float milliseconds = 0;
+        cudaEventElapsedTime(&milliseconds, start, stop);
+        printf("[INFO] Iteration %d coloring time: %f ms\n", iter, milliseconds);
+
         int h_n_colored[numBlocks];
         int new_colored = 0;
         cudaMemcpy(h_n_colored, n_colored, sizeof(int) * numBlocks, cudaMemcpyDeviceToHost);

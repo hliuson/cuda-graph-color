@@ -2,3 +2,4 @@
 *.out
 afinal
 *.edges
+**.csv
